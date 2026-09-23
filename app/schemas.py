@@ -110,3 +110,30 @@ class TicketInfo(BaseModel):
 class TicketResponse(TicketInfo):
     # 明文随机票据，仅在签发响应中返回这一次；服务端只存它的哈希。
     ticket: str = Field(..., description="凭票下载令牌（明文仅本次返回，请妥善保管）")
+
+
+# ---------------------------------------------------------------------------
+# 运维：存储汇总
+# ---------------------------------------------------------------------------
+
+
+class StorageSummaryRow(BaseModel):
+    status: str
+    session_count: int
+    declared_bytes: int = Field(..., description="各会话声明的 total_size 之和")
+    stored_bytes: int = Field(
+        ...,
+        description="实际占用字节：uploading 取 bytes_received，completed 取 total_size，其余为 0",
+    )
+
+
+class StorageSummaryTotal(BaseModel):
+    session_count: int
+    declared_bytes: int
+    stored_bytes: int
+
+
+class StorageSummaryResponse(BaseModel):
+    # 固定包含 uploading/completed/aborted/expired 四行，计数为零也保留。
+    statuses: list[StorageSummaryRow]
+    total: StorageSummaryTotal

@@ -10,6 +10,7 @@
   POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
   GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
   POST   /tickets/{ticket}/revoke       撤销票据
+  GET    /storage/summary               运维汇总：按状态统计会话数与字节量（只读快照）
 """
 from __future__ import annotations
 
@@ -714,6 +715,55 @@ def revoke_ticket(ticket: str) -> dict:
             "SELECT * FROM download_tickets WHERE id = ?", (ticket_id,)
         ).fetchone()
     return _ticket_payload(row)
+
+
+# ---------------------------------------------------------------------------
+# 运维：存储汇总
+# ---------------------------------------------------------------------------
+
+# 响应固定包含这四种状态，顺序恒定；计数为零的状态也保留该行。
+_SUMMARY_STATUSES = ("uploading", "completed", "aborted", "expired")
+
+
+@app.get(
+    "/api/v1/storage/summary",
+    response_model=schemas.StorageSummaryResponse,
+    tags=["ops"],
+)
+def storage_summary() -> dict:
+    """按状态汇总会话数、声明字节量与实际存储字节量。
+
+    单条 GROUP BY 查询即一个只读快照，全部聚合取自同一一致性视图；
+    纯 SELECT：不扫描文件系统，也不更新 last_access_at 或滑动会话 TTL。
+    """
+    rows = db.get_conn().execute(
+        "SELECT status, COUNT(*) AS session_count, "
+        "SUM(total_size) AS declared_bytes, "
+        "SUM(CASE status "
+        "    WHEN 'uploading' THEN bytes_received "
+        "    WHEN 'completed' THEN total_size "
+        "    ELSE 0 END) AS stored_bytes "
+        "FROM upload_sessions GROUP BY status"
+    ).fetchall()
+    by_status = {row["status"]: row for row in rows}
+
+    statuses = []
+    for status in _SUMMARY_STATUSES:
+        row = by_status.get(status)
+        statuses.append(
+            {
+                "status": status,
+                "session_count": row["session_count"] if row else 0,
+                "declared_bytes": row["declared_bytes"] if row else 0,
+                "stored_bytes": row["stored_bytes"] if row else 0,
+            }
+        )
+    # 总计不做第二次查询，直接由四种状态行求和，保证与明细严格一致。
+    total = {
+        key: sum(row[key] for row in statuses)
+        for key in ("session_count", "declared_bytes", "stored_bytes")
+    }
+    return {"statuses": statuses, "total": total}
 
 
 # ---------------------------------------------------------------------------

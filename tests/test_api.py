@@ -273,3 +273,82 @@ def test_concurrent_overlapping_chunks_only_one_wins(client: TestClient) -> None
     status = client.get(f"/api/v1/sessions/{sid}").json()
     assert status["bytes_received"] == 100
     assert status["fully_received"] is True
+
+
+def test_storage_summary(client: TestClient) -> None:
+    import uuid
+
+    from app import db
+
+    def fetch() -> dict:
+        resp = client.get("/api/v1/storage/summary")
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def row_for(body: dict, status: str) -> dict:
+        return next(r for r in body["statuses"] if r["status"] == status)
+
+    # 数据库为整个测试会话共享，一律用基线差值断言。
+    baseline = fetch()
+    # 固定返回四种状态，即使计数为零也保留该行；总计等于状态行求和。
+    assert [r["status"] for r in baseline["statuses"]] == [
+        "uploading",
+        "completed",
+        "aborted",
+        "expired",
+    ]
+    for key in ("session_count", "declared_bytes", "stored_bytes"):
+        assert baseline["total"][key] == sum(r[key] for r in baseline["statuses"])
+
+    # uploading：declared=1000，stored 取 bytes_received=100。
+    up_data = b"u" * 1000
+    up_sid = _create(client, up_data)
+    r = client.put(
+        f"/api/v1/sessions/{up_sid}/chunks?start=0&end=100", content=up_data[:100]
+    )
+    assert r.status_code == 200, r.text
+    before = client.get(f"/api/v1/sessions/{up_sid}").json()
+
+    # completed：declared=stored=total_size=5。
+    done_data = b"hello"
+    done_sid = _create(client, done_data)
+    client.put(f"/api/v1/sessions/{done_sid}/chunks?start=0&end=5", content=done_data)
+    assert client.post(f"/api/v1/sessions/{done_sid}/complete").status_code == 200
+
+    # aborted/expired：主流程里 aborted 会被硬删除、expired 由后台清理翻转，
+    # 这里直接落库两行，专注验证聚合口径（stored 恒为 0）。
+    now_iso = storage.iso(storage.utcnow())
+    with db.immediate() as tx:
+        for sid, status, declared, received in (
+            (uuid.uuid4().hex, "aborted", 700, 300),
+            (uuid.uuid4().hex, "expired", 900, 400),
+        ):
+            tx.execute(
+                "INSERT INTO upload_sessions ("
+                "id, filename, total_size, sha256_expected, chunk_size, "
+                "status, bytes_received, created_at, expires_at, last_access_at"
+                ") VALUES (?, 'ops.bin', ?, ?, 0, ?, ?, ?, ?, ?)",
+                (sid, declared, "a" * 64, status, received, now_iso, now_iso, now_iso),
+            )
+
+    after = fetch()
+    expected = {
+        "uploading": (1, 1000, 100),
+        "completed": (1, 5, 5),
+        "aborted": (1, 700, 0),
+        "expired": (1, 900, 0),
+    }
+    for status, (count, declared, stored) in expected.items():
+        base, row = row_for(baseline, status), row_for(after, status)
+        assert row["session_count"] - base["session_count"] == count
+        assert row["declared_bytes"] - base["declared_bytes"] == declared
+        assert row["stored_bytes"] - base["stored_bytes"] == stored
+
+    # 总计仍由状态行求和得到。
+    for key in ("session_count", "declared_bytes", "stored_bytes"):
+        assert after["total"][key] == sum(r[key] for r in after["statuses"])
+
+    # 只读汇总不得滑动 TTL 或更新 last_access_at。
+    again = client.get(f"/api/v1/sessions/{up_sid}").json()
+    assert again["last_access_at"] == before["last_access_at"]
+    assert again["expires_at"] == before["expires_at"]
