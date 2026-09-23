@@ -11,6 +11,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import quote
 
 from . import settings
 
@@ -58,6 +59,32 @@ def immediate() -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.commit()
+
+
+@contextmanager
+def read_only() -> Iterator[sqlite3.Connection]:
+    """打开一个与线程连接缓存隔离的只读连接（uri mode=ro）。
+
+    专供运维只读查询使用：连接本身被 PRAGMA query_only 再次兜底，
+    既不会写库（不触碰 last_access_at / TTL），也不参与任何事务状态。
+    每次调用独立建连、用完即关，绝不复用可写连接。
+    """
+    path = _db_path().resolve()
+    uri = f"file:{quote(str(path))}?mode=ro"
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=30.0,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

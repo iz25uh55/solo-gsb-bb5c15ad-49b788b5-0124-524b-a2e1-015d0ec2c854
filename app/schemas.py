@@ -110,3 +110,38 @@ class TicketInfo(BaseModel):
 class TicketResponse(TicketInfo):
     # 明文随机票据，仅在签发响应中返回这一次；服务端只存它的哈希。
     ticket: str = Field(..., description="凭票下载令牌（明文仅本次返回，请妥善保管）")
+
+
+# ---------------------------------------------------------------------------
+# 运维只读汇总
+# ---------------------------------------------------------------------------
+
+
+class StorageStatusSummary(BaseModel):
+    """单个状态的汇总行（四种状态固定各一行，计数为零也保留）。"""
+
+    status: str = Field(
+        ..., description="会话状态：uploading / completed / aborted / expired"
+    )
+    session_count: int = Field(..., ge=0, description="该状态的会话数量")
+    declared_bytes: int = Field(
+        ..., ge=0, description="声明字节数：所有会话 total_size 之和"
+    )
+    stored_bytes: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "实际占用的逻辑字节数：uploading 取 bytes_received 之和，"
+            "completed 取 total_size 之和，aborted / expired 恒为 0"
+        ),
+    )
+
+
+class StorageSummaryResponse(BaseModel):
+    statuses: list[StorageStatusSummary] = Field(
+        ...,
+        description="按 uploading、completed、aborted、expired 固定顺序排列的四行",
+    )
+    total: StorageStatusSummary = Field(
+        ..., description="四行求和的总计（status 字段为 total）"
+    )

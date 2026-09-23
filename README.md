@@ -223,6 +223,33 @@ DELETE /api/v1/sessions/{session_id}
 
 幂等，返回 `204`：删除会话记录、已收分片与成品。
 
+### 10. 存储汇总（运维只读）
+
+```http
+GET /api/v1/storage/summary
+```
+
+在**单个 SQLite 只读快照**中按会话状态汇总，供运维容量观测。响应固定包含 `uploading`、`completed`、`aborted`、`expired` 四行（即使计数为零也保留），外加由四行求和得到的 `total` 行：
+
+```json
+{
+  "statuses": [
+    {"status": "uploading", "session_count": 3, "declared_bytes": 210, "stored_bytes": 130},
+    {"status": "completed", "session_count": 1, "declared_bytes": 10,  "stored_bytes": 10},
+    {"status": "aborted",   "session_count": 0, "declared_bytes": 0,   "stored_bytes": 0},
+    {"status": "expired",   "session_count": 0, "declared_bytes": 0,   "stored_bytes": 0}
+  ],
+  "total": {"status": "total", "session_count": 4, "declared_bytes": 220, "stored_bytes": 140}
+}
+```
+
+字段口径：
+
+- `declared_bytes`：该状态所有会话 `total_size`（客户端声明大小）之和。
+- `stored_bytes`：实际占用的逻辑字节数——`uploading` 取 `bytes_received` 之和，`completed` 取 `total_size` 之和，`aborted` / `expired` 恒为 `0`。
+
+该接口是**纯只读**的：以 `mode=ro` + `PRAGMA query_only` 的独立连接执行单条聚合 SQL，**不扫描文件系统、不更新 `last_access_at`、不滑动会话 TTL，也不触发访问时懒过期**（已过 `expires_at` 但尚未被后台清理的会话仍按 `uploading` 统计）。
+
 ### 状态码与生命周期
 
 | 状态 | 含义 |

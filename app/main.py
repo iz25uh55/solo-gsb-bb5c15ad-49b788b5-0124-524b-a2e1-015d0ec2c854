@@ -10,6 +10,7 @@
   POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
   GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
   POST   /tickets/{ticket}/revoke       撤销票据
+  GET    /storage/summary              运维只读：按四种状态汇总会话与字节数
 """
 from __future__ import annotations
 
@@ -714,6 +715,68 @@ def revoke_ticket(ticket: str) -> dict:
             "SELECT * FROM download_tickets WHERE id = ?", (ticket_id,)
         ).fetchone()
     return _ticket_payload(row)
+
+
+# ---------------------------------------------------------------------------
+# 运维只读汇总
+#
+# 仅在单个 SQLite 只读快照中做聚合：不调用 _load_session（不触发懒过期）、
+# 不更新 last_access_at、不滑动 TTL，也完全不接触文件系统。
+# ---------------------------------------------------------------------------
+
+# 固定四种状态及其输出顺序；缺失状态以零补齐，保证响应恒为四行。
+_SUMMARY_STATUSES = ("uploading", "completed", "aborted", "expired")
+
+
+@app.get(
+    "/api/v1/storage/summary",
+    response_model=schemas.StorageSummaryResponse,
+    tags=["ops"],
+)
+def storage_summary() -> dict:
+    # 单条 GROUP BY 语句在只读连接上一次执行完成，四行计数取自同一快照；
+    # SQLite 默认每条语句隐式包裹自己的读事务，读期间看到一致的数据库版本。
+    stats: dict[str, dict[str, int]] = {
+        status: {"session_count": 0, "declared_bytes": 0, "stored_bytes": 0}
+        for status in _SUMMARY_STATUSES
+    }
+    with db.read_only() as conn:
+        rows = conn.execute(
+            "SELECT status, "
+            "COUNT(*) AS session_count, "
+            "COALESCE(SUM(total_size), 0) AS declared_bytes, "
+            # stored_bytes 仅按状态语义取字节数：
+            # uploading 取已收字节，completed 取成品总大小，其余状态恒为 0。
+            "COALESCE(SUM(CASE status "
+            "WHEN 'uploading' THEN bytes_received "
+            "WHEN 'completed' THEN total_size "
+            "ELSE 0 END), 0) AS stored_bytes "
+            "FROM upload_sessions GROUP BY status"
+        ).fetchall()
+
+    for row in rows:
+        stats[row["status"]] = {
+            "session_count": row["session_count"],
+            "declared_bytes": row["declared_bytes"],
+            "stored_bytes": row["stored_bytes"],
+        }
+
+    statuses = [
+        {
+            "status": status,
+            "session_count": stats[status]["session_count"],
+            "declared_bytes": stats[status]["declared_bytes"],
+            "stored_bytes": stats[status]["stored_bytes"],
+        }
+        for status in _SUMMARY_STATUSES
+    ]
+    total = {
+        "status": "total",
+        "session_count": sum(item["session_count"] for item in statuses),
+        "declared_bytes": sum(item["declared_bytes"] for item in statuses),
+        "stored_bytes": sum(item["stored_bytes"] for item in statuses),
+    }
+    return {"statuses": statuses, "total": total}
 
 
 # ---------------------------------------------------------------------------
